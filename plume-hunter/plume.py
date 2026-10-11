@@ -37,6 +37,20 @@ KNOWN_SOURCES = [
     ("Anand Vihar bus terminal", 28.6470, 77.3160),
 ]
 
+# Approximate reference points are used only as map labels, never as evidence.
+CITY_SOURCES = {
+    "delhi": KNOWN_SOURCES,
+    "mumbai": [("Deonar landfill", 19.043, 72.927),
+               ("Taloja industrial area", 19.061, 73.116),
+               ("Chembur industrial area", 19.051, 72.900)],
+    "kolkata": [("Dhapa landfill", 22.540, 88.414),
+                ("Dankuni industrial area", 22.680, 88.270),
+                ("Garden Reach industrial area", 22.540, 88.300)],
+    "hyderabad": [("Jawaharnagar landfill", 17.550, 78.545),
+                  ("Jeedimetla industrial area", 17.520, 78.450),
+                  ("Patancheru industrial area", 17.530, 78.265)],
+}
+
 
 def to_xy(lat, lon, lat0, lon0):
     """Lat/lon -> metres east/north of (lat0, lon0)."""
@@ -182,7 +196,7 @@ def make_grid(bbox=DELHI_BBOX, step_km=1.0):
 
 
 def invert(hours, bbox=DELHI_BBOX, step_km=1.0, noise_ug=10.0,
-           background_pct=20, min_wind_ms=1.0, H=2.0):
+           background_pct=20, min_wind_ms=1.0, H=2.0, sources=None):
     """Find the most likely single ground-level source.
 
     hours: list of dicts, one per hour, each:
@@ -260,7 +274,7 @@ def invert(hours, bbox=DELHI_BBOX, step_km=1.0, noise_ug=10.0,
         la, lo = lats[i], lons[j]
         if all(haversine_km(la, lo, t["lat"], t["lon"]) > 3.0 for t in top):
             top.append({"lat": la, "lon": lo, "prob": p, "q_gps": qbest[i][j],
-                        "near": nearest_known(la, lo)})
+                        "near": nearest_known(la, lo, sources)})
         if len(top) == 3:
             break
 
@@ -299,9 +313,9 @@ def invert(hours, bbox=DELHI_BBOX, step_km=1.0, noise_ug=10.0,
     }
 
 
-def nearest_known(lat, lon):
+def nearest_known(lat, lon, sources=None):
     name, d = None, 1e9
-    for n, la, lo in KNOWN_SOURCES:
+    for n, la, lo in (sources if sources is not None else KNOWN_SOURCES):
         dd = haversine_km(lat, lon, la, lo)
         if dd < d:
             name, d = n, dd

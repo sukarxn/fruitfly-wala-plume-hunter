@@ -1,5 +1,8 @@
 stations.json
 hours.json
+fly_track.json
+result.json
 __pycache__/
 *.png
 .env
+preview.html
