@@ -50,7 +50,11 @@ def trial(stations, n_hours):
         hour, pred = make_hour(stations, src, Q, random.uniform(2, 4), (wind0 + 30 * h) % 360)
         hours.append(hour)
         hits = max(hits, sum(p > 3 * NOISE for p in pred))
-    res = plume.invert(hours)
+    if n_hours >= 24:
+        grids = [plume.hourly_grid(h) for h in hours]
+        res = plume.invert_hourly_grids(grids, min_hours=24)
+    else:
+        res = plume.invert(hours)
     err = plume.haversine_km(src[0], src[1], res["best"]["lat"], res["best"]["lon"]) \
         if res["best"] else None
     return {"detectable": hits >= 2, "err": err, "res": res}
@@ -60,8 +64,8 @@ def main():
     stations = station_layout()
     print(f"{len(stations)} stations, noise {NOISE} ug/m3\n")
     last = None
-    for n_hours in (1, 3):
-        runs = [trial(stations, n_hours) for _ in range(40)]
+    for n_hours, trials in ((1, 40), (3, 40), (168, 3)):
+        runs = [trial(stations, n_hours) for _ in range(trials)]
         det = [r for r in runs if r["detectable"]]
         errs = [r["err"] for r in det if r["err"] is not None]
         false_alarm = sum(1 for r in runs if not r["detectable"]

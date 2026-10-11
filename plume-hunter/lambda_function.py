@@ -32,6 +32,7 @@ s3 = boto3.client("s3")
 BUCKET = os.environ.get("BUCKET")
 LATEST = "results/latest.json"
 STATION_SNAPSHOT = "results/stations/latest.json"
+HISTORY_HOURS = 168
 
 
 def _api_key():
@@ -75,7 +76,7 @@ def _run_city(city, key, demo=False, locations=None, cpcb_readings=None):
         hours = _demo_hours(sensors, city)
     else:
         sensors, hours = data.build_hours(key, city=city, locations=locations,
-                                          cpcb_readings=cpcb_readings)
+                                          cpcb_readings=cpcb_readings, use_last_known=False)
     cfg = data.CITIES[city]
     if demo and hours:
         timestamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -85,6 +86,70 @@ def _run_city(city, key, demo=False, locations=None, cpcb_readings=None):
     return {"city": city, "city_name": cfg["name"], "demo": demo,
             "generated_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="minutes"),
             "stations": sensors, "hours": hours}
+
+
+def _history_result(city, sensors, key, demo=False):
+    """Maintain per-hour readings and error grids in S3, then combine the 7-day window."""
+    now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+    start = now - dt.timedelta(hours=HISTORY_HOURS)
+    prefix = f"history/{city}/"
+    marker = _get_json(prefix + "backfill.json")
+    backfill = not marker
+    fetch_start = start if backfill else now - dt.timedelta(hours=3)
+    weather = data.weather_hours(city, past_days=7)
+    observed = data.history_hours(sensors, key, fetch_start, now)
+    # A dated CPCB observation is valid only for its own hour, never today's hour.
+    by_name = {s["name"]: s for s in sensors}
+    for hour in observed:
+        obj = _get_json(prefix + hour + ".json") or {"readings": {}}
+        obj.setdefault("readings", {}).update(observed[hour])
+        if hour in weather:
+            obj["met"] = weather[hour]
+        obj["hour_utc"] = hour
+        obj["stations"] = [dict(name=n, lat=by_name[n]["lat"], lon=by_name[n]["lon"],
+                                 pm25=v["value"], last_reading_utc=v["timestamp"], source=v["source"])
+                           for n, v in obj["readings"].items() if n in by_name]
+        if obj.get("met") and len(obj["stations"]) >= 4 and not obj.get("grid"):
+            obj["grid"] = plume.hourly_grid({"hour_utc": hour, "stations": obj["stations"], "met": obj["met"]},
+                                            bbox=data.CITIES[city]["bbox"])
+        s3.put_object(Bucket=BUCKET, Key=prefix + hour + ".json", Body=json.dumps(obj).encode(),
+                      ContentType="application/json")
+    if backfill:
+        # Persist empty hours too, so unavailable hours are not refetched indefinitely.
+        for offset in range(HISTORY_HOURS):
+            hour = (now - dt.timedelta(hours=offset + 1)).strftime("%Y-%m-%dT%H")
+            if _get_json(prefix + hour + ".json") is None:
+                obj = {"hour_utc": hour, "readings": {}, "met": weather.get(hour)}
+                s3.put_object(Bucket=BUCKET, Key=prefix + hour + ".json", Body=json.dumps(obj).encode(),
+                              ContentType="application/json")
+        s3.put_object(Bucket=BUCKET, Key=prefix + "backfill.json",
+                      Body=json.dumps({"completed_utc": now.isoformat()}).encode(),
+                      ContentType="application/json")
+    grids = []
+    history_hours = []
+    for offset in range(HISTORY_HOURS):
+        hour = (now - dt.timedelta(hours=offset + 1)).strftime("%Y-%m-%dT%H")
+        obj = _get_json(prefix + hour + ".json")
+        if not obj:
+            continue
+        if obj.get("met") and len(obj.get("stations", [])) >= 4:
+            history_hours.append(obj)
+        if obj.get("grid"):
+            grids.append(obj["grid"])
+    result = plume.invert_hourly_grids(grids, bbox=data.CITIES[city]["bbox"],
+                                       sources=plume.CITY_SOURCES[city])
+    result.update({"label": "Likely source areas, last 7 days",
+                   "hours_available": len(history_hours), "window_hours": HISTORY_HOURS,
+                   "start_utc": start.isoformat(), "end_utc": now.isoformat(),
+                   "headline": plume.headline(result)})
+    # Where smoke from the 7-day candidates travelled, using each hour's own wind.
+    window = [(now - dt.timedelta(hours=o + 1)).strftime("%Y-%m-%dT%H") for o in range(HISTORY_HOURS)]
+    # Recorded hourly winds, so fly swarms can be run under each of them (fly_hunter --winds history).
+    result["winds"] = [dict(weather[h], hour_utc=h) for h in window if h in weather]
+    result["corridor"] = plume.weekly_corridor(result,
+                                        [weather[h] for h in window if h in weather],
+                                        bbox=data.CITIES[city]["bbox"])
+    return result
 
 
 def run(demo=False):
@@ -133,6 +198,15 @@ def run(demo=False):
                                 for s in current if s.get("last_pm25") is not None)
         signature = (hashlib.sha256(json.dumps(signature_data, sort_keys=True).encode()).hexdigest()
                      if signature_data else None)
+        weekly = None
+        if not demo and not res.get("city_error"):
+            try:
+                weekly = _history_result(city, current, key)
+            except Exception as e:
+                if os.environ.get("DEBUG") == "1":
+                    print("weekly history update failed", city, type(e).__name__)
+                old_weekly = _get_json(f"results/{city}/latest.json") or {}
+                weekly = old_weekly.get("history")
         if res.get("city_error"):
             cached_result = _get_json(f"results/{city}/latest.json")
             if cached_result:
@@ -147,7 +221,11 @@ def run(demo=False):
             (signature and signature == old_snapshot.get("data_signature")) or
             (not signature and cached_result is not None)))
         if no_new_observations:
+            cached_result["history"] = weekly
             results[city] = cached_result
+            changed = True
+            s3.put_object(Bucket=BUCKET, Key=f"results/{city}/latest.json",
+                          Body=json.dumps(cached_result).encode(), ContentType="application/json")
             index["cities"].append({"id": city, "name": cfg["name"],
                                     "centre": cfg["centre"], "verdict": cached_result["verdict"],
                                     "hours_used": cached_result["hours_used"]})
@@ -164,6 +242,7 @@ def run(demo=False):
                                "hours": [{"hour_utc": h["hour_utc"], "met": h["met"],
                                           "stations": h["stations"]}
                                          for h in res.get("hours", [])]})
+            calculated["history"] = weekly
             res = calculated
         changed = True
         res["data_signature"] = signature
@@ -262,6 +341,10 @@ def lambda_handler(event, context):
     station_snapshot = _get_json(STATION_SNAPSHOT) or {"stations": []}
     html = PAGE.replace("__DATA__", json.dumps(res).replace("</", "<\\/"))
     html = html.replace("__FLY__", json.dumps(fly))
+    # Accumulated swarms (fly_density.py), kept separately for demo and live results.
+    flymap = _get_json("results/fly_density_demo.json" if (res or {}).get("demo")
+                       else "results/fly_density.json")
+    html = html.replace("__FLYMAP__", json.dumps((flymap or {}).get("summary")))
     html = html.replace("__STATIONS__", json.dumps(station_snapshot.get("stations", [])))
     html = html.replace("__SOURCES__", json.dumps(plume.CITY_SOURCES.get(city, [])))
     html = html.replace("__CITY_INDEX__", json.dumps(city_index))

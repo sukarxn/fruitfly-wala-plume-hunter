@@ -14,9 +14,9 @@ Track: **Air** · Environmental Hacks (Bharat Builds Tour, WeMakeDevs × AWS)
    C = Q / (π u σy σz) · exp(−y² / 2σy²) · exp(−H² / 2σz²)
 
    using Briggs urban dispersion coefficients, a Pasquill stability class (A–F) from wind speed and sunshine or night cloud, and a 15° hourly wind-meander term.
-4. **Inversion.** For each cell the best source strength Q has a closed form; the misfit between predicted and measured excess is summed over up to 3 hours. As the wind turns, each hour's plume points a different way, and only the true source fits all of them.
-5. **Honest output.** A probability heat map, the top 3 candidate areas labelled with the nearest known source (landfills, industrial areas), and a plain verdict: *local source*, *regional haze*, or *wind too calm to tell*. The model refuses to guess when fewer than 2 stations see a plume.
-6. **Alert.** Medium or high-confidence local sources trigger an email through Amazon SNS.
+4. **Inversion.** The current result combines the latest 3 usable hours. Separately, the 7-day map combines cached per-hour error grids for up to 168 hours. Each reading is paired with wind from that same hour; a source must explain many changing wind directions. New hours add one grid, and hours outside the rolling window are ignored.
+5. **Honest output.** The page shows the 7-day source map and top 3 candidate areas separately from the current 3-hour verdict. The weekly map is hidden until at least 24 usable hours are available; weekly and current readings never substitute a stale value into a different hour.
+6. **Alert.** Medium or high-confidence local sources from the current 3-hour result trigger an email through Amazon SNS. The weekly summary never triggers alerts.
 
 ## Results (synthetic recovery test)
 
@@ -26,8 +26,9 @@ Track: **Air** · Environmental Hacks (Bharat Builds Tour, WeMakeDevs × AWS)
 | --- | --- | --- |
 | 1 | 4 / 40 | 2.5 km |
 | 3 | 9 / 40 | **0.9 km** (7 of 8 within 3 km) |
+| 168 | 3 / 3 | **0.7 km** (3 of 3 within 3 km) |
 
-**The finding:** when the plume reaches two or more stations, the physics pins the source to about 1 km. Most of the time it doesn't, because Delhi's station network is sparse compared with plume widths. That is itself useful: it shows where extra low-cost sensors would make enforcement possible.
+The 168-hour result is an initial three-trial check; it needs a larger run before treating 0.7 km as a stable accuracy estimate. The persistent source was detectable in all three week-long trials. Short-lived sources are averaged into the weekly history and are not the target of that map.
 
 ## Fly Hunter: the real fruit-fly connectome tracks the plume
 

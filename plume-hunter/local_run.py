@@ -74,6 +74,14 @@ def main():
     res["cpcb_status"] = cpcb_status
     res["generated_utc"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="minutes")
     res["hours"] = hours
+    if os.path.exists("history_seed.json"):
+        with open("history_seed.json", encoding="utf-8") as f:
+            seed = json.load(f)
+        res["history"] = seed.get("history")
+        if res["history"] and "corridor" not in res["history"]:  # seeds made before corridors
+            res["history"]["corridor"] = plume.weekly_corridor(
+                res["history"], [h.get("met") for h in seed.get("hours", [])],
+                bbox=data.CITIES["delhi"]["bbox"])
     if demo and hours:
         res["stations"] = [dict(s, last_pm25=s["pm25"],
                                  last_reading_utc=res["generated_utc"],
@@ -96,11 +104,20 @@ def main():
         with open("fly_track.json") as f:
             fly = json.load(f)
 
+    # Accumulated swarms: --flymap PATH, else fly_density[_demo].json if present.
+    flymap = None
+    fm_path = (sys.argv[sys.argv.index("--flymap") + 1] if "--flymap" in sys.argv
+               else "fly_density_demo.json" if demo else "fly_density.json")
+    if os.path.exists(fm_path):
+        with open(fm_path) as f:
+            flymap = json.load(f).get("summary")
+
     with open("page.html", encoding="utf-8") as f:
         page = f.read()
     page = (page.replace("__DATA__", json.dumps(res).replace("</", "<\\/"))
                 .replace("__SOURCES__", json.dumps(plume.KNOWN_SOURCES))
                 .replace("__FLY__", json.dumps(fly))
+                .replace("__FLYMAP__", json.dumps(flymap))
                 .replace("__CITY_INDEX__", json.dumps({"cities": [
                     {"id": "delhi", "name": "Delhi", "centre": [28.63, 77.15],
                      "hours_used": res.get("hours_used", 0)}]}))
@@ -109,7 +126,8 @@ def main():
     with open("preview.html", "w", encoding="utf-8") as f:
         f.write(page)
     print("Wrote preview.html")
-    webbrowser.open("file://" + os.path.abspath("preview.html"))
+    if "--no-open" not in sys.argv:
+        webbrowser.open("file://" + os.path.abspath("preview.html"))
 
 
 if __name__ == "__main__":

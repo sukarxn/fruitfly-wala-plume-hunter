@@ -56,6 +56,7 @@
     <div id="verdict"></div>
     <div id="freshness" class="muted"></div>
     <div class="facts" id="facts"></div>
+    <div id="history-summary" class="verdict"></div>
     <div id="top"></div>
     <div class="legend">Station PM2.5:
       <span class="sw" style="background:#16a34a"></span>&lt;60
@@ -63,7 +64,7 @@
       <span class="sw" style="background:#f97316"></span>120–250
       <span class="sw" style="background:#b91c1c"></span>&gt;250
       <span class="sw" style="background:#9ca3af"></span>no current reading</div>
-    <div class="legend">Shaded cells: likely source area. Blue arrow: wind direction. Purple: fly-brain search path.</div>
+    <div class="legend">7-day map: dark blue = stronger relative fit; contrast is boosted for visibility. Teal: modelled smoke corridors from the 7-day candidates. Orange: right-now analysis.</div>
     <div class="btns" style="margin-top:14px">
       <a href="?run=1">Run now (may take minutes)</a><a href="?demo=1">Demo: synthetic fire</a><a href="?">Latest</a>
     </div>
@@ -77,6 +78,16 @@
 const R = __DATA__;
 const SOURCES = __SOURCES__;
 const FLY = __FLY__;
+const FLYMAP = __FLYMAP__;
+// The accumulated fly map belongs to one result: same demo/live state, lead candidate within 5 km.
+function flyMapMatches() {
+  if (!FLYMAP || !R) return false;
+  const near = (a, b) => a && b && Math.hypot((a.lat - b.lat) * 111, (a.lon - b.lon) * 97) < 5;
+  const lead = (FLYMAP.candidates || [])[0];
+  return Boolean(FLYMAP.demo) === Boolean(R.demo) &&
+    ((R.verdict === 'local' && near(lead, R.best)) ||
+     (R.history && R.history.verdict === 'local' && near(lead, R.history.best)));
+}
 const STATIONS = __STATIONS__;
 const CITY_INDEX = __CITY_INDEX__;
 const CITY = '__CITY__';
@@ -96,6 +107,10 @@ esri.on('tileerror', () => {
 
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const col = v => v < 60 ? '#16a34a' : v < 120 ? '#eab308' : v < 250 ? '#f97316' : '#b91c1c';
+const historyLayer = L.layerGroup().addTo(map);
+const currentLayer = L.layerGroup();
+const corridorLayer = L.layerGroup().addTo(map);
+const flyMapLayer = L.layerGroup().addTo(map);
 const stationPane = document.getElementById('station-pane');
 const showStation = s => {
   const fresh = isFresh(s), value = s.last_pm25;
@@ -145,8 +160,52 @@ if (!R) {
   document.getElementById('verdict').innerHTML =
     '<div class="verdict cannot_localise"><b>No result yet</b>Press “Run now”.</div>';
 } else {
+  const weekly = R.history;
+  const summary = document.getElementById('history-summary');
+  if (weekly) {
+    const ready = weekly.grid && weekly.best;
+    summary.innerHTML = `<b>Likely source areas, last 7 days</b><div class="muted">${esc(weekly.headline || '')}</div><div class="muted">${weekly.hours_used || 0} usable hours · ${weekly.stations_used || 0} station-hours${weekly.explained != null ? ` · ${Math.round(weekly.explained * 100)}% fit` : ''}</div>` +
+      (weekly.explained != null && weekly.explained < 0.3 ? '<div class="muted">Weak fit: darker cells show relative ranking, not a confirmed source.</div>' : '') +
+      (weekly.top && weekly.top.length ? '<ol>' + weekly.top.map(t => `<li>${t.near.km <= 3 ? 'Near ' + esc(t.near.name) : esc(t.near.km) + ' km from ' + esc(t.near.name)} · ${t.lat.toFixed(3)}, ${t.lon.toFixed(3)}</li>`).join('') + '</ol>' :
+        `<div class="muted">${esc(weekly.reason || 'Not enough historical data yet.')}</div>`);
+    if (ready) {
+      const g = weekly.grid;
+      const values = g.prob.flat().sort((a, b) => a - b);
+      const quantile = q => values[Math.min(values.length - 1, Math.floor(q * (values.length - 1)))];
+      const low = quantile(0.65), high = quantile(0.995);
+      const dlat = (g.lats[1] - g.lats[0]) / 2, dlon = (g.lons[1] - g.lons[0]) / 2;
+      g.lats.forEach((la, i) => g.lons.forEach((lo, j) => {
+        const p = g.prob[i][j];
+        if (p < low) return;
+        const score = high > low ? Math.max(0, Math.min(1, (p - low) / (high - low))) : 1;
+        const red = Math.round(191 - 161 * score), green = Math.round(219 - 184 * score), blue = Math.round(254 - 111 * score);
+        L.rectangle([[la - dlat, lo - dlon], [la + dlat, lo + dlon]],
+          {stroke:false, fillColor:`rgb(${red},${green},${blue})`, fillOpacity:0.12 + 0.86 * Math.pow(score, 0.55)}).addTo(historyLayer);
+      }));
+      map.setView([weekly.best.lat, weekly.best.lon], 11);
+    }
+    // Modelled smoke corridors: time-averaged plume footprint of the 7-day candidates,
+    // each hour with its own wind (plume.corridor). Relative values, max = 1.
+    const cor = weekly.corridor;
+    if (!cor && weekly.grid) {
+      summary.insertAdjacentHTML('beforeend', '<div class="muted">Smoke corridors are drawn once the 7-day fit explains at least 30% of the readings.</div>');
+    }
+    if (cor) {
+      const dlat = (cor.lats[1] - cor.lats[0]) / 2, dlon = (cor.lons[1] - cor.lons[0]) / 2;
+      cor.lats.forEach((la, i) => cor.lons.forEach((lo, j) => {
+        const c = cor.value[i][j];
+        if (c < 0.03) return;
+        L.rectangle([[la - dlat, lo - dlon], [la + dlat, lo + dlon]],
+          {stroke:false, fillColor:'#0f766e', fillOpacity:0.08 + 0.5 * Math.sqrt(c)}).addTo(corridorLayer);
+      }));
+      summary.insertAdjacentHTML('beforeend', `<div class="muted">Teal: where smoke from these candidates
+        would have travelled over ${cor.hours} hours of recorded wind (modelled from the candidates above, not measured).</div>`);
+    }
+  } else {
+    summary.innerHTML = '<b>Likely source areas, last 7 days</b><div class="muted">Waiting for the scheduled run to build the historical map.</div>';
+  }
   const v = document.getElementById('verdict');
-  v.innerHTML = `<div class="verdict ${esc(R.verdict)}">${R.demo ? '<span class="demo">DEMO · SYNTHETIC FIRE</span>' : ''}
+  v.innerHTML = `<div class="verdict ${esc(R.verdict)}"><b>Right now · current 3-hour analysis</b>${R.demo ? '<span class="demo">DEMO · SYNTHETIC FIRE</span>' : ''}
     <b>${esc(R.headline)}</b>${R.reason ? esc(R.reason) : ''}</div>`;
   const h = (R.hours || [])[0];
   const staleIn = h ? h.stations.filter(s => s.stale) : [];
@@ -172,7 +231,7 @@ if (!R) {
     document.getElementById('top').innerHTML = '<b>Most likely source areas</b><ol>' +
       R.top.map(t => `<li>${t.lat.toFixed(3)}, ${t.lon.toFixed(3)} · p=${t.prob.toFixed(2)}<br>
       <span class="muted">${t.near.km} km from ${esc(t.near.name)} · ~${Math.round(t.q_gps)} g/s</span></li>`).join('') + '</ol>';
-    R.top.forEach((t, i) => L.marker([t.lat, t.lon]).bindPopup(`#${i + 1}: ${esc(t.near.name)}`).addTo(map));
+    R.top.forEach((t, i) => L.marker([t.lat, t.lon]).bindPopup(`#${i + 1}: ${esc(t.near.name)}`).addTo(currentLayer));
   }
   document.getElementById('when').textContent = 'Generated ' + R.generated_utc + ' UTC' +
     (h ? ` · data hour ${h.hour_utc} UTC` : '');
@@ -183,9 +242,8 @@ if (!R) {
     g.lats.forEach((la, i) => g.lons.forEach((lo, j) => {
       const p = g.prob[i][j] / mx;
       if (p > 0.02) L.rectangle([[la - dlat, lo - dlon], [la + dlat, lo + dlon]],
-        {stroke:false, fillColor:'#c2410c', fillOpacity:0.15 + 0.6 * p}).addTo(map);
+        {stroke:false, fillColor:'#c2410c', fillOpacity:0.15 + 0.6 * p}).addTo(currentLayer);
     }));
-    map.setView([R.best.lat, R.best.lon], 12);
   }
   if (h) {
     const towards = (h.met.wind_from + 180) % 360;
@@ -194,7 +252,7 @@ if (!R) {
     const c = currentCity ? currentCity.centre : [28.63, 77.15];
     L.marker([c[0] + 0.23, c[1] - 0.23], {icon}).bindTooltip('Wind blows this way').addTo(map);
   }
-  const flyEnd = FLY && FLY.track && FLY.track.length ? FLY.track[FLY.track.length - 1] : null;
+  const flyEnd = FLY && FLY.track && FLY.track.length && !flyMapMatches() ? FLY.track[FLY.track.length - 1] : null;
   const flyMatches = flyEnd && R && R.verdict === 'local' && R.best &&
     Math.hypot((flyEnd[0] - R.best.lat) * 111,
       (flyEnd[1] - R.best.lon) * 111 * Math.cos((currentCity ? currentCity.centre[0] : R.best.lat) * Math.PI / 180)) < 5;
@@ -224,6 +282,40 @@ if (!R) {
       ${FLY.successes}/${FLY.attempts} searches reached the source. Purple path: ${FLY.found ? 'one successful search' : 'an unsuccessful search'} (${FLY.decisions} decisions).</div>`);
   }
 }
+// A local right-now result (live or demo) is the most specific answer: centre on it.
+if (R && R.verdict === 'local' && R.best) map.setView([R.best.lat, R.best.lon], 12);
+// Accumulated fly paths (fly_density.py): cells most swarms passed through, plus the
+// most-followed route per candidate. Drawn only for the result the swarms targeted.
+if (flyMapMatches()) {
+  {
+    // Every retained path, faint; overlaps build up darker where flies repeat.
+    const faint = L.canvas({padding:0.3});
+    (FLYMAP.paths || []).forEach(p => L.polyline(p.line, {renderer:faint, color:'#6d28d9', weight:1.2,
+      opacity:Math.max(0.09, 0.16 * p.w), interactive:false}).addTo(flyMapLayer));
+    // Confident cells, shaded relative to the most-used cell: most repeated = darkest.
+    const half = FLYMAP.cell_m / 2 / 111000, halfLon = half / Math.cos(28.65 * Math.PI / 180);
+    const pmax = Math.max(FLYMAP.p_max || 0, ...FLYMAP.cells.map(c => c[2]), 1e-6);
+    FLYMAP.cells.forEach(([la, lo, p]) => L.rectangle([[la - half, lo - halfLon], [la + half, lo + halfLon]],
+      {stroke:false, fillColor:'#4c1d95', fillOpacity:0.1 + 0.7 * Math.pow(p / pmax, 1.5)}).addTo(flyMapLayer));
+    FLYMAP.routes.forEach(r => L.polyline(r.line, {color:'#2e1065', weight:2 + 5 * r.median_p,
+      opacity:0.35 + 0.6 * Math.min(1, r.median_p / pmax)})
+      .bindTooltip(`Most-followed route to candidate #${r.candidate + 1} (median ${Math.round(r.median_p * 100)}% of flies)`)
+      .addTo(flyMapLayer));
+    const who = FLYMAP.steer === 'brain' ? 'connectome-steered flies' : `${esc(FLYMAP.steer)}-steered control flies`;
+    const nPaths = (FLYMAP.paths || []).length;
+    const nWinds = new Set((FLYMAP.run_winds || []).map(w => w.hour_utc)).size;
+    document.getElementById('top').insertAdjacentHTML('beforeend',
+      `<div class="verdict" style="border-color:#c4b5fd;background:#f5f3ff"><b>🪰 Accumulated fly paths</b>
+      ${FLYMAP.runs} swarms of ${who}${nWinds > 1 ? `, each under a different recorded hour's wind (${nWinds} hours)` : ''}, ${nPaths} paths kept (effective ${Math.round(FLYMAP.n_eff)}; older runs fade with a
+      ${Math.round(FLYMAP.half_life_h / 24 * 10) / 10}-day half-life). Faint lines: every path. Shaded: cells at least ${Math.round(FLYMAP.tau * 100)}% of flies
+      passed through (95% confidence). Lines: most-followed routes. The smoke the flies follow is simulated from the physics'
+      estimate, so this shows how reliably they trace it, not where real smoke went.</div>`);
+  }
+}
+L.control.layers(null, {"Likely source areas, last 7 days":historyLayer,
+  "Modelled smoke corridors, last 7 days":corridorLayer,
+  "Accumulated fly paths":flyMapLayer,
+  "Right now · current 3-hour analysis":currentLayer}, {collapsed:false}).addTo(map);
 </script>
 </body>
 </html>

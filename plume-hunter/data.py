@@ -234,13 +234,13 @@ def last_known_pm25(sensor, key, days=10):
     return best
 
 
-def weather_hours(city="delhi"):
+def weather_hours(city="delhi", past_days=1):
     """Hourly wind/cloud/sun at a city's centre. Returns {hour_key: met}."""
     centre = CITIES[city]["centre"]
     q = urllib.parse.urlencode({
         "latitude": centre[0], "longitude": centre[1],
         "hourly": "wind_speed_10m,wind_direction_10m,cloud_cover,shortwave_radiation,is_day",
-        "wind_speed_unit": "ms", "timezone": "UTC", "past_days": 1, "forecast_days": 1,
+        "wind_speed_unit": "ms", "timezone": "UTC", "past_days": past_days, "forecast_days": 1,
     })
     d = _get(f"https://api.open-meteo.com/v1/forecast?{q}")["hourly"]
     out = {}
@@ -261,13 +261,55 @@ def weather_hours(city="delhi"):
     return out
 
 
+def history_hours(sensors, key, start, end):
+    """Fetch all available OpenAQ hourly readings within an explicit UTC window."""
+    table = {}
+    for i, sensor in enumerate(sensors):
+        if not sensor.get("sensor_id"):
+            continue
+        try:
+            response = _openaq(f"/sensors/{sensor['sensor_id']}/hours", {
+                "datetime_from": start.isoformat().replace("+00:00", "Z"),
+                "datetime_to": end.isoformat().replace("+00:00", "Z"),
+                "limit": 200,
+            }, key)
+        except Exception as e:
+            if DEBUG:
+                print("skip history", sensor["name"], e)
+            continue
+        for row in response.get("results", []):
+            value = row.get("value")
+            stamp = _utc(row.get("period") or row.get("datetime"))
+            hour = _hour_key(stamp)
+            if value is None or stamp is None or hour is None or not 0 <= value <= 2000:
+                continue
+            table.setdefault(hour, {})[sensor["name"]] = {
+                "value": float(value), "timestamp": stamp, "source": sensor.get("source", "OpenAQ")}
+        time.sleep(1.05)
+    return table
+
+
+def assemble_history(sensors, readings, weather):
+    """Merge hourly readings and matching-hour wind into inversion input."""
+    hours = []
+    for hour in sorted(readings, reverse=True):
+        if hour not in weather:
+            continue
+        by_name = readings[hour]
+        stations = [dict(name=s["name"], lat=s["lat"], lon=s["lon"],
+                         pm25=v["value"], last_reading_utc=v["timestamp"], source=v["source"])
+                    for s in sensors for v in [by_name.get(s["name"])] if v]
+        if len(stations) >= 4:
+            hours.append({"hour_utc": hour, "stations": stations, "met": weather[hour]})
+    return hours
+
+
 def build_hours(key, n_hours=3, city="delhi", locations=None, cpcb_readings=None,
-                use_last_known=True):
+                use_last_known=False):
     """Everything plume.invert() needs, newest hours first.
 
-    use_last_known: CPCB stations with no recent reading contribute their last
-    known value (up to 10 days old) to every hour. Those entries carry
-    stale=True and their real timestamp so the page and alerts can say so.
+    Historical readings are used only by the rolling history pipeline, paired
+    with wind from their own hour; they are never carried into the current run.
     """
     sensors = pm25_sensors(key, city, locations)
     cpcb_readings = cpcb_readings or []

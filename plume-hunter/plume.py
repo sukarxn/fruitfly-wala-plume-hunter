@@ -313,6 +313,136 @@ def invert(hours, bbox=DELHI_BBOX, step_km=1.0, noise_ug=10.0,
     }
 
 
+def hourly_grid(hour, bbox=DELHI_BBOX, step_km=1.0, noise_ug=10.0,
+                background_pct=20, min_wind_ms=1.0, H=2.0):
+    """Cacheable raw error contribution for one hour (no probability normalization)."""
+    stations = [s for s in hour["stations"] if s.get("pm25") is not None]
+    met = hour["met"]
+    if len(stations) < 4 or met["wind_ms"] < min_wind_ms:
+        return None
+    bg = percentile([s["pm25"] for s in stations], background_pct)
+    excess = [max(s["pm25"] - bg, 0.0) for s in stations]
+    lats, lons = make_grid(bbox, step_km)
+    errors = []
+    for la in lats:
+        row = []
+        for lo in lons:
+            g = [plume_shape(*to_xy(s["lat"], s["lon"], la, lo), met["wind_ms"],
+                             met["wind_from"], met["stability"], H) for s in stations]
+            gg = sum(v * v for v in g)
+            q = max(sum(a * b for a, b in zip(g, excess)) / gg, 0.0) if gg else 0.0
+            row.append(sum((e - q * v) ** 2 for e, v in zip(excess, g)))
+        errors.append(row)
+    return {"hour_utc": hour.get("hour_utc"), "lats": lats, "lons": lons,
+            "errors": errors, "background_ug": bg, "station_count": len(stations),
+            "null_misfit": sum(e * e for e in excess),
+            "hits": sum(e > 3 * noise_ug for e in excess)}
+
+
+def invert_hourly_grids(grids, bbox=DELHI_BBOX, noise_ug=10.0, sources=None,
+                        min_hours=24):
+    """Combine cached per-hour error grids into a rolling multi-day result."""
+    usable = [g for g in grids if g]
+    base = {"grid": None, "verdict": "cannot_localise", "best": None,
+            "top": [], "hours_used": len(usable), "stations_used": sum(g["station_count"] for g in usable)}
+    if len(usable) < min_hours:
+        base["reason"] = f"Only {len(usable)} usable hours; at least {min_hours} are needed for the 7-day map."
+        return base
+    if max(g["hits"] for g in usable) < 2:
+        base.update(verdict="regional", reason="No hour showed a plume at 2 or more stations.")
+        return base
+    lats, lons = usable[0]["lats"], usable[0]["lons"]
+    misfit = [[sum(g["errors"][i][j] for g in usable) for j in range(len(lons))]
+              for i in range(len(lats))]
+    m_min = min(map(min, misfit))
+    # Independent hourly sensor noise accumulates; scale likelihood to total observations.
+    scale = 2 * noise_ug * noise_ug * sum(g["station_count"] for g in usable)
+    prob = [[math.exp(-(v - m_min) / scale) for v in row] for row in misfit]
+    total = sum(map(sum, prob))
+    prob = [[v / total for v in row] for row in prob]
+    cells = sorted(((prob[i][j], i, j) for i in range(len(lats)) for j in range(len(lons))), reverse=True)
+    top = []
+    for p, i, j in cells:
+        la, lo = lats[i], lons[j]
+        if all(haversine_km(la, lo, t["lat"], t["lon"]) > 3 for t in top):
+            top.append({"lat": la, "lon": lo, "prob": p, "q_gps": 0,
+                        "near": nearest_known(la, lo, sources)})
+        if len(top) == 3:
+            break
+    null = sum(g["null_misfit"] for g in usable)
+    explained = 0 if null <= 0 else max(0, min(1, 1 - misfit[cells[0][1]][cells[0][2]] / null))
+    dists = sorted((haversine_km(top[0]["lat"], top[0]["lon"], lats[i], lons[j]), prob[i][j])
+                   for i in range(len(lats)) for j in range(len(lons)))
+    acc, r50 = 0.0, 0.0
+    for distance, probability in dists:
+        acc += probability
+        r50 = distance
+        if acc >= 0.5:
+            break
+    if explained < 0.3:
+        verdict, confidence = "regional", "low"
+    elif explained > 0.7 and r50 < 3:
+        verdict, confidence = "local", "high"
+    elif explained > 0.5 and r50 < 6:
+        verdict, confidence = "local", "medium"
+    else:
+        verdict, confidence = "local", "low"
+    flat = sorted(v for row in prob for v in row)
+    base.update(verdict=verdict, confidence=confidence, explained=round(explained, 3),
+                radius50_km=round(r50, 2), best=top[0], top=top,
+                # best cell vs the median cell; ~1 means a flat map (no source signal)
+                peak_ratio=round(cells[0][0] / flat[len(flat) // 2], 2),
+                background_ug=round(sum(g["background_ug"] for g in usable) / len(usable), 1),
+                grid={"lats": lats, "lons": lons, "prob": [[round(v, 6) for v in row] for row in prob]})
+    return base
+
+
+def corridor(sources, mets, bbox=DELHI_BBOX, step_km=1.0, min_wind_ms=1.0, H=2.0):
+    """Time-averaged ground-level smoke footprint of the candidate sources.
+
+    C(x) = (1/N) * sum over hours h, sources k of  p_k * plume_shape(x - s_k, met_h)
+
+    sources: [{"lat", "lon", "prob"}, ...] (e.g. the 7-day top-3). Emission rates
+    are not known from the 7-day fit, so each source is weighted by its
+    probability only: the result is a relative footprint, not ug/m3.
+    mets: hourly met dicts across the window; calm hours are skipped because
+    their plume direction is undefined (same rule as the inversion).
+    Returns {"lats", "lons", "value"} with values scaled so the maximum is 1.
+    """
+    mets = [m for m in mets if m and m.get("wind_ms", 0) >= min_wind_ms]
+    srcs = [s for s in sources if s.get("prob", 0) > 0]
+    if not mets or not srcs:
+        return None
+    ptot = sum(s["prob"] for s in srcs)
+    lats, lons = make_grid(bbox, step_km)
+    value = []
+    for la in lats:
+        row = []
+        for lo in lons:
+            offsets = [(s["prob"] / ptot, to_xy(la, lo, s["lat"], s["lon"])) for s in srcs]
+            row.append(sum(w * plume_shape(dx, dy, m["wind_ms"], m["wind_from"],
+                                           m["stability"], H)
+                           for m in mets for w, (dx, dy) in offsets))
+        value.append(row)
+    mx = max(map(max, value))
+    if mx <= 0:
+        return None
+    return {"lats": lats, "lons": lons, "hours": len(mets),
+            "value": [[round(v / mx, 4) for v in row] for row in value]}
+
+
+def weekly_corridor(result, mets, bbox=DELHI_BBOX):
+    """Corridor for a 7-day result, only when that fit found a local source.
+
+    In the synthetic 7-day test no-source runs explain ~11% and planted sources
+    78-97%, so the same 30% 'local' threshold decides whether candidates are
+    trustworthy enough to draw where their smoke went.
+    """
+    if result.get("verdict") != "local" or not result.get("top"):
+        return None
+    return corridor(result["top"], mets, bbox)
+
+
 def nearest_known(lat, lon, sources=None):
     name, d = None, 1e9
     for n, la, lo in (sources if sources is not None else KNOWN_SOURCES):
