@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plume Hunter · Delhi</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root { --bg:#f6f4ef; --panel:#fffdf8; --ink:#1d1b18; --muted:#6b665e; --line:#e3ddd1;
+          --hot:#c2410c; --ok:#15803d; --warn:#b45309; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); }
+  .wrap { display:grid; grid-template-columns: 360px 1fr; height:100vh; }
+  aside { padding:20px; overflow:auto; border-right:1px solid var(--line); background:var(--panel); }
+  h1 { font-size:20px; margin:0 0 2px; letter-spacing:-.01em; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:16px; }
+  .verdict { padding:14px; border-radius:10px; border:1px solid var(--line); margin-bottom:14px; }
+  .verdict b { display:block; font-size:16px; margin-bottom:4px; }
+  .local { border-color:#fdba74; background:#fff7ed; }
+  .regional { border-color:#bbf7d0; background:#f0fdf4; }
+  .cannot_localise { border-color:#fde68a; background:#fffbeb; }
+  .demo { display:inline-block; background:#1d1b18; color:#fff; font-size:11px; padding:2px 7px;
+          border-radius:99px; margin-bottom:8px; letter-spacing:.04em; }
+  .facts { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:12px 0; }
+  .fact { border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  .fact span { display:block; color:var(--muted); font-size:12px; }
+  .fact strong { font-size:16px; }
+  ol { padding-left:18px; margin:6px 0 14px; }
+  li { margin-bottom:6px; }
+  .muted { color:var(--muted); font-size:12.5px; }
+  .btns a { display:inline-block; margin:4px 6px 0 0; padding:6px 10px; border:1px solid var(--line);
+            border-radius:8px; color:var(--ink); text-decoration:none; font-size:13px; background:#fff; }
+  .legend { display:flex; gap:6px; align-items:center; font-size:12px; color:var(--muted); margin-top:6px; }
+  .sw { width:14px; height:14px; border-radius:50%; display:inline-block; }
+  #map { height:100%; }
+  .arrow { font-size:34px; color:#2563eb; text-shadow:0 1px 2px #fff; line-height:1; }
+  @media (max-width: 800px) { .wrap { grid-template-columns:1fr; grid-template-rows:auto 60vh; height:auto; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <aside>
+    <h1>Plume Hunter</h1>
+    <div class="sub">Where is Delhi's bad air coming from? Gaussian plume source finder.</div>
+    <div id="verdict"></div>
+    <div class="facts" id="facts"></div>
+    <div id="top"></div>
+    <div class="legend">Station PM2.5:
+      <span class="sw" style="background:#16a34a"></span>&lt;60
+      <span class="sw" style="background:#eab308"></span>60–120
+      <span class="sw" style="background:#f97316"></span>120–250
+      <span class="sw" style="background:#b91c1c"></span>&gt;250</div>
+    <div class="legend">Shaded cells: likely source area. Blue arrow: wind direction.</div>
+    <div class="btns" style="margin-top:14px">
+      <a href="?run=1">Run now (~1 min)</a><a href="?demo=1">Demo: synthetic fire</a><a href="?">Latest</a>
+    </div>
+    <p class="muted" id="when"></p>
+    <p class="muted">Method: background removed (20th-percentile station), then every 1 km cell in Delhi is tested as a source with the Gaussian plume model (Briggs urban dispersion, Pasquill stability). Cells that best explain the readings across up to 3 hours light up. Regional smoke (e.g. stubble burning) shows as background, not a local source.</p>
+  </aside>
+  <div id="map"></div>
+</div>
+<script>
+const R = __DATA__;
+const SOURCES = __SOURCES__;
+const map = L.map('map').setView([28.63, 77.15], 11);
+L.tileLayer('https://{s}.basemap.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+  {attribution:'&copy; OpenStreetMap &copy; CARTO', maxZoom:18}).addTo(map);
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const col = v => v < 60 ? '#16a34a' : v < 120 ? '#eab308' : v < 250 ? '#f97316' : '#b91c1c';
+
+SOURCES.forEach(([n, la, lo]) => L.circleMarker([la, lo], {radius:4, color:'#6b665e', weight:1,
+  fillOpacity:.6}).bindTooltip(n).addTo(map));
+
+if (!R) {
+  document.getElementById('verdict').innerHTML =
+    '<div class="verdict cannot_localise"><b>No result yet</b>Press “Run now”.</div>';
+} else {
+  const v = document.getElementById('verdict');
+  v.innerHTML = `<div class="verdict ${esc(R.verdict)}">${R.demo ? '<span class="demo">DEMO · SYNTHETIC FIRE</span>' : ''}
+    <b>${esc(R.headline)}</b>${R.reason ? esc(R.reason) : ''}</div>`;
+  const h = (R.hours || [])[0];
+  const facts = [];
+  if (h) {
+    facts.push(['Wind', `${Math.round(h.met.wind_from)}° @ ${h.met.wind_ms.toFixed(1)} m/s`]);
+    facts.push(['Stability', h.met.stability]);
+    facts.push(['Stations', h.stations.length]);
+  }
+  facts.push(['Hours used', R.hours_used]);
+  if (R.background_ug != null) facts.push(['Background', R.background_ug + ' µg/m³']);
+  if (R.explained != null) facts.push(['Fit explains', Math.round(R.explained * 100) + '%']);
+  document.getElementById('facts').innerHTML = facts.map(([k, x]) =>
+    `<div class="fact"><span>${k}</span><strong>${esc(x)}</strong></div>`).join('');
+  if (R.verdict === 'local' && R.top && R.top.length) {
+    document.getElementById('top').innerHTML = '<b>Most likely source areas</b><ol>' +
+      R.top.map(t => `<li>${t.lat.toFixed(3)}, ${t.lon.toFixed(3)} · p=${t.prob.toFixed(2)}<br>
+      <span class="muted">${t.near.km} km from ${esc(t.near.name)} · ~${Math.round(t.q_gps)} g/s</span></li>`).join('') + '</ol>';
+    R.top.forEach((t, i) => L.marker([t.lat, t.lon]).bindPopup(`#${i + 1}: ${esc(t.near.name)}`).addTo(map));
+  }
+  document.getElementById('when').textContent = 'Generated ' + R.generated_utc + ' UTC' +
+    (h ? ` · data hour ${h.hour_utc} UTC` : '');
+
+  if (R.grid && R.verdict === 'local') {
+    const g = R.grid, mx = Math.max(...g.prob.flat());
+    const dlat = (g.lats[1] - g.lats[0]) / 2, dlon = (g.lons[1] - g.lons[0]) / 2;
+    g.lats.forEach((la, i) => g.lons.forEach((lo, j) => {
+      const p = g.prob[i][j] / mx;
+      if (p > 0.02) L.rectangle([[la - dlat, lo - dlon], [la + dlat, lo + dlon]],
+        {stroke:false, fillColor:'#c2410c', fillOpacity:0.15 + 0.6 * p}).addTo(map);
+    }));
+    map.setView([R.best.lat, R.best.lon], 12);
+  }
+  if (h) {
+    h.stations.forEach(s => L.circleMarker([s.lat, s.lon], {radius:7, color:'#fff', weight:1.5,
+      fillColor:col(s.pm25), fillOpacity:.95}).bindTooltip(`${esc(s.name)}: ${Math.round(s.pm25)} µg/m³`).addTo(map));
+    const towards = (h.met.wind_from + 180) % 360;
+    const icon = L.divIcon({className:'', html:`<div class="arrow" style="transform:rotate(${towards}deg)">↑</div>`,
+      iconSize:[34, 34], iconAnchor:[17, 17]});
+    L.marker([28.86, 76.92], {icon}).bindTooltip('Wind blows this way').addTo(map);
+  }
+}
+</script>
+</body>
+</html>

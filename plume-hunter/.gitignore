@@ -1,0 +1,5 @@
+stations.json
+hours.json
+__pycache__/
+*.png
+.env
